@@ -157,13 +157,6 @@ def kernel_unified_attention_2d(
         cache_modifier=Q_cache_modifier,
     )
 
-    # Dequantize Q if it's FP8 (required for tl.dot to work)
-    if Q.dtype.is_fp8():
-        if q_scale is not None:
-            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
-        else:
-            Q = Q.to(tl.float32)
-
     block_table_offset = seq_idx * block_table_stride
 
     if not USE_SINKS:
@@ -362,8 +355,14 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
+        if V.dtype.is_fp8():
+            if P.dtype == tl.float32:
+                P_scale = 1.0 / 448.0
+                P_scaled = P * P_scale
+                P = tl.cast(P_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
+
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P, V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -495,14 +494,6 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
-
-    # Dequantize Q if it's FP8 (required for tl.dot to work)
-    if Q.dtype.is_fp8():
-        if q_scale is not None:
-            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
-        else:
-            Q = Q.to(tl.float32)
-
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -683,8 +674,14 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
+        if V.dtype.is_fp8():
+            if P.dtype == tl.float32:
+                P_scale = 1.0 / 448.0
+                P_scaled = P * P_scale
+                P = tl.cast(P_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
+
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P, V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
