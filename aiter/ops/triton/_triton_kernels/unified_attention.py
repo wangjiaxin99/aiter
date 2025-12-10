@@ -63,6 +63,7 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
     out_scale,  # float32
@@ -155,6 +156,13 @@ def kernel_unified_attention_2d(
         other=0.0,
         cache_modifier=Q_cache_modifier,
     )
+
+    # Dequantize Q if it's FP8 (required for tl.dot to work)
+    if Q.dtype.is_fp8():
+        if q_scale is not None:
+            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
+        else:
+            Q = Q.to(tl.float32)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -393,6 +401,7 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
@@ -486,6 +495,14 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+
+    # Dequantize Q if it's FP8 (required for tl.dot to work)
+    if Q.dtype.is_fp8():
+        if q_scale is not None:
+            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
+        else:
+            Q = Q.to(tl.float32)
+
 
     block_table_offset = seq_idx * block_table_stride
 
