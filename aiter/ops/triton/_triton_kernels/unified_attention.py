@@ -52,6 +52,58 @@ def find_seq_idx(
 
 
 @triton.jit
+def _mxfp8_quant_op(
+    x,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_M,
+    QUANT_BLOCK_SIZE,
+):
+    """
+    将 FP32 的 x 转换为 microscaling FP8 (e4m3) 格式
+    
+    Args:
+        x: [BLOCK_SIZE_M, BLOCK_SIZE_N] FP32 tensor
+        QUANT_BLOCK_SIZE: 每个 scale 对应的元素数量（如 32）
+    
+    Returns:
+        x_fp8: [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 tensor
+        scale_e8m0: [BLOCK_SIZE_M, NUM_QUANT_BLOCKS] uint8 tensor
+    """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+    
+    # 1. Reshape 以便按块计算 scale
+    x_reshaped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+    
+    # 2. 计算每个块的最大绝对值
+    amax = tl.max(tl.abs(x_reshaped), axis=-1, keep_dims=True)
+    
+    # 3. 处理零值的情况（避免 log2(0)）
+    amax = tl.where(amax > 0, amax, 1.0)
+    
+    # 4. 计算 log2(amax) - FP8 e4m3 的最大值约为 448
+    # 我们希望 scale 后的最大值接近 FP8 的表示范围
+    scale_exp = tl.log2(amax).floor()
+    scale_exp = tl.clamp(scale_exp, min=-127, max=127)
+    
+    # 5. 转换为 e8m0 格式（只有指数，无尾数）
+    scale_e8m0 = (scale_exp + 127).to(tl.uint8)
+    
+    # 6. 计算实际的缩放因子
+    quant_scale = tl.exp2(-scale_exp)
+    
+    # 7. 缩放并转换为 FP8
+    x_scaled = x_reshaped * quant_scale
+    
+    # 8. 使用 tl.cast 转换（在正确的范围内）
+    x_fp8 = tl.cast(x_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
+    
+    # 9. Reshape 回原始形状
+    x_fp8 = x_fp8.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)
+    scale_e8m0 = scale_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+    
+    return x_fp8, scale_e8m0
+
+@triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -101,6 +153,7 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    PACK_ALONG_K: tl.constexpr = True,  # 添加这一行
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -287,15 +340,21 @@ def kernel_unified_attention_2d(
 
         if V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
-                V = V_load
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float32)
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float32)
         else:
-            V = V_load
+            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(tl.float32)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
+
+        # 如果 Q 和 K 都是 FP8，需要补偿 scale
+        if Q.dtype.is_fp8() and K.dtype.is_fp8():
+            q_scale_val = tl.load(q_scale)
+            k_scale_val = tl.load(k_scale)
+            S = S * q_scale_val * k_scale_val
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -355,14 +414,37 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
-        if V.dtype.is_fp8():
-            if P.dtype == tl.float32:
-                P_scale = 1.0 / 448.0
-                P_scaled = P * P_scale
-                P = tl.cast(P_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
+        # if V_load.dtype.is_fp8():  # 判断原始加载的类型
+        #     # 完全按照 FP4 的流程
+        #     # 1. 量化 P 为 FP8
+        #     p_fp8, scale_p = _mxfp8_quant_op(P * 6.0, TILE_SIZE, BLOCK_M, 32)
+            
+        #     # 2. 转置 V（V 现在是 FP32）
+        #     vt = tl.trans(V)
+            
+        #     # 3. 量化 V 为 FP8
+        #     v_fp8, scale_v = _mxfp8_quant_op(vt, TILE_SIZE, HEAD_SIZE_PADDED, 32)
+            
+        #     # 4. 转置回来
+        #     v_fp8_t = tl.trans(v_fp8)
+        #     scale_v_t = tl.trans(scale_v)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P, V)
+        #     # 5. 使用 tl.dot_scaled（参考 FP4 的 line 626-627）
+        #     acc_fp8 = tl.dot_scaled(
+        #         p_fp8, scale_p, "e4m3",
+        #         v_fp8_t, scale_v_t, "e4m3",
+        #         acc * 6.0,  # 预缩放 accumulator
+        #         lhs_k_pack=PACK_ALONG_K,
+        #         rhs_k_pack=PACK_ALONG_K,
+        #         out_dtype=tl.float32
+        #     ) / 6.0  # 缩放回来
+            
+        #     acc = acc_fp8  # 更新 acc（不是 +=，是直接赋值）
+        # else:
+        #     # V 不是 FP8，正常计算
+        #     acc += tl.dot(P.to(V.dtype), V)
+
+        acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -494,6 +576,11 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    if Q.dtype.is_fp8():
+        if q_scale is not None:
+            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
+        else:
+            Q = Q.to(tl.float32)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -674,14 +761,14 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
-        if V.dtype.is_fp8():
-            if P.dtype == tl.float32:
-                P_scale = 1.0 / 448.0
-                P_scaled = P * P_scale
-                P = tl.cast(P_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
+        # if V.dtype.is_fp8():
+        #     if P.dtype == tl.float32:
+        #         P_scale = 1.0 / 448.0
+        #         P_scaled = P * P_scale
+        #         P = tl.cast(P_scaled, dtype=tl.float8e4nv, fp_downcast_rounding="rtne")
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P, V)
+        acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
