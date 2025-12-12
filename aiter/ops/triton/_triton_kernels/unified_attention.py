@@ -157,12 +157,12 @@ def kernel_unified_attention_2d(
         cache_modifier=Q_cache_modifier,
     )
 
-    # Dequantize Q if it's FP8 (required for tl.dot to work)
-    if Q.dtype.is_fp8():
-        if q_scale is not None:
-            Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
-        else:
-            Q = Q.to(tl.float32)
+    # # Dequantize Q if it's FP8 (required for tl.dot to work)
+    # if Q.dtype.is_fp8():
+    #     if q_scale is not None:
+    #         Q = (Q.to(tl.float32) * tl.load(q_scale)).to(tl.float32)
+    #     else:
+    #         Q = Q.to(tl.float32)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -300,9 +300,68 @@ def kernel_unified_attention_2d(
         else:
             V = V_load
 
+        # pid0 = tl.program_id(axis=0)
+        # pid1 = tl.program_id(axis=1)
+
+        # if pid0 == 0 and pid1 == 0:
+        #     if V.dtype==tl.float8e5:
+        #         tl.device_print("float8e5  float8e5  float8e5  float8e5")
+        #     elif V.dtype==tl.float8e4b8:
+        #         tl.device_print("float8e4b8  float8e4b8  float8e4b8  float8e4b8")
+        #     elif V.dtype==tl.float8e5b16:
+        #         tl.device_print("float8e5b16  float8e5b16  float8e5b16  float8e5b16")
+        #     elif V.dtype==tl.float8e4nv:
+        #         tl.device_print("float8e4nv  float8e4nv  float8e4nv  float8e4nv")
+        #     elif V.dtype==tl.float8e4b15:
+        #         tl.device_print("float8e4b15  float8e4b15  float8e4b15  float8e4b15")
+        #     else:
+        #         tl.device_print("other  other  other  other")
+        v_scale_val = tl.load(v_scale)
+
+
+        # pid0 = tl.program_id(axis=0)
+        # pid1 = tl.program_id(axis=1)
+
+        # if pid0 == 0 and pid1 == 0:
+        #     if Q.dtype==tl.float8e5:
+        #         tl.device_print("float8e5  float8e5  float8e5  float8e5")
+        #     elif Q.dtype==tl.float8e4b8:
+        #         tl.device_print("float8e4b8  float8e4b8  float8e4b8  float8e4b8")
+        #     elif Q.dtype==tl.float8e5b16:
+        #         tl.device_print("float8e5b16  float8e5b16  float8e5b16  float8e5b16")
+        #     elif Q.dtype==tl.float8e4nv:
+        #         tl.device_print("float8e4nv  float8e4nv  float8e4nv  float8e4nv") #result
+        #     elif Q.dtype==tl.float8e4b15:
+        #         tl.device_print("float8e4b15  float8e4b15  float8e4b15  float8e4b15")
+        #     else:
+        #         tl.device_print("other  other  other  other")
+
+        # if pid0 == 0 and pid1 == 0:
+        #     if K.dtype==tl.float8e5:
+        #         tl.device_print("float8e5  float8e5  float8e5  float8e5")
+        #     elif K.dtype==tl.float8e4b8:
+        #         tl.device_print("float8e4b8  float8e4b8  float8e4b8  float8e4b8")
+        #     elif K.dtype==tl.float8e5b16:
+        #         tl.device_print("float8e5b16  float8e5b16  float8e5b16  float8e5b16")
+        #     elif K.dtype==tl.float8e4nv:
+        #         tl.device_print("float8e4nv  float8e4nv  float8e4nv  float8e4nv") #result
+        #     elif K.dtype==tl.float8e4b15:
+        #         tl.device_print("float8e4b15  float8e4b15  float8e4b15  float8e4b15")
+        #     else:
+        #         tl.device_print("other  other  other  other")
+
+
+        Q_new = Q.to(tl.float32)
+        Q_new = tl.math.exp2(Q_new)
+        Q_new = Q_new.to(tl.float8e4nv)
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        S = qk_scale * tl.dot(Q_new, K)
+
+        if Q.dtype.is_fp8() and K.dtype.is_fp8():
+            q_scale_val = tl.load(q_scale)
+            k_scale_val = tl.load(k_scale)
+            S = S * q_scale_val * k_scale_val
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -362,8 +421,85 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        # # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc += tl.dot(P.to(V.dtype), V)
+
+        # pid0 = tl.program_id(axis=0)
+        # pid1 = tl.program_id(axis=1)
+
+        # if pid0 == 0 and pid1 == 0:
+        #     if V.dtype==tl.float8e5:
+        #         tl.static_print("float8e5  float8e5  float8e5  float8e5")
+        #     elif V.dtype==tl.float8e4b8:
+        #         tl.static_print("float8e4b8  float8e4b8  float8e4b8  float8e4b8")
+        #     elif V.dtype==tl.float8e5b16:
+        #         tl.static_print("float8e5b16  float8e5b16  float8e5b16  float8e5b16")
+        #     elif V.dtype==tl.float8e4nv:
+        #         tl.static_print("float8e4nv  float8e4nv  float8e4nv  float8e4nv")  # result
+        #     elif V.dtype==tl.float8e4b15:
+        #         tl.static_print("float8e4b15  float8e4b15  float8e4b15  float8e4b15")
+        #     else:
+        #         tl.static_print("other  other  other  other")
+
+        #     tl.static_print("P:",P.shape[0], P.shape[1])
+
+        # pid0 = tl.program_id(axis=0)
+        # pid1 = tl.program_id(axis=1)
+
+        # if pid0 == 0 and pid1 == 0:
+        #     tl.static_print("=== P 转换调试 ===")
+            
+        #     # 打印 P 的类型
+        #     if P.dtype == tl.float32:
+        #         tl.static_print("P dtype: float32")
+        #     elif P.dtype == tl.float16:
+        #         tl.static_print("P dtype: float16")
+        #     elif P.dtype == tl.bfloat16:
+        #         tl.static_print("P dtype: bfloat16")
+        #     elif P.dtype.is_fp8():
+        #         tl.static_print("P dtype: FP8")
+            
+        #     # 打印 P 的值范围
+        #     tl.device_print("P min:", tl.min(P))
+        #     tl.device_print("P max:", tl.max(P))
+        
+        # P_scale = 1.0 / 448.0
+        # P_scaled = P / P_scale
+
+        # if pid0 == 0 and pid1 == 0:
+        #     # 打印 P_scaled 的类型
+        #     if P_scaled.dtype == tl.float32:
+        #         tl.static_print("P_scaled dtype: float32")
+        #     elif P_scaled.dtype == tl.float16:
+        #         tl.static_print("P_scaled dtype: float16")
+        #     elif P_scaled.dtype.is_fp8():
+        #         tl.static_print("P_scaled dtype: FP8")
+            
+            # # 打印 P_scaled 的值范围
+            # tl.device_print("P_scaled min:", tl.min(P_scaled))
+            # tl.device_print("P_scaled max:", tl.max(P_scaled))
+
+
+        # P_scaled = tl.trans(tl.trans(P_scaled))
+        # P_fp8 = P_scaled.to(tl.float8e4b8)
+        P_fp32 = P.to(tl.float32)
+        P_fp8 = P.to(tl.float8e4nv)
+
+
+        # P_fp8 = P_scaled.to(tl.float8e4nv)
+        # P_fp8 = tl.trans(tl.trans(P_fp8))
+
+
+        # P_bf16 = P_scaled.to(tl.float8e4b8)
+        # P_fp8 = P_bf16.to(tl.float8e4nv)
+
+        acc += tl.dot(P_fp8, V)
+
+        # acc += tl.dot(P.to(V.dtype), V)
+
+        # acc_1 = tl.dot(P_fp8, V)
+        # acc_1 = acc_1 * P_scale * v_scale_val
+        # acc += acc_1
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
