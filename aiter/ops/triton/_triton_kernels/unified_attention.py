@@ -63,8 +63,10 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
+    p_scale,  # float32
     out_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
@@ -294,7 +296,12 @@ def kernel_unified_attention_2d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if Q.dtype.is_fp8() and K.dtype.is_fp8():
+            q_scale_val = tl.load(q_scale)
+            k_scale_val = tl.load(k_scale)
+            S = qk_scale * tl.dot(Q, K) * k_scale_val * q_scale_val
+        else:
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -354,8 +361,21 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if Q.dtype.is_fp8():
+            P_scale_val = tl.load(p_scale)
+            v_scale_val = tl.load(v_scale)
+            P_scaled = P / P_scale_val
+            P_32 = P_scaled.to(tl.float32)
+            P_8 = P_32.to(tl.float8e4nv)
+            P_32_2 = P_8.to(tl.float32)
+            V_32 = V.to(tl.float32)
+
+            acc_1 = tl.dot(P_32_2, V_32)
+            acc_1 = acc_1 * P_scale_val * v_scale_val
+            acc += acc_1
+        else:
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -393,8 +413,10 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
+    p_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -583,8 +605,16 @@ def kernel_unified_attention_3d(
             if Q.dtype.is_fp8():
                 K = K_load
             else:
+                tl.static_print(f"??????????????????????Q is not fp8 and K is fp8")
+                k_scale_val = tl.load(k_scale)
+                # if tl.program_id(0) == 0 and tl.program_id(1) == 0 and tl.program_id(2) == 0:
+                #     tl.device_print("k_scale_val:", k_scale_val)
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
+            k_scale_val = tl.load(k_scale)
+            if tl.program_id(0) == 0 and tl.program_id(1) == 0 and tl.program_id(2) == 0:
+                tl.device_print("k_scale_val:", k_scale_val)
+            tl.static_print(f"??????????????????????Q is not fp8 and K is not fp8")
             K = K_load
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -599,15 +629,27 @@ def kernel_unified_attention_3d(
             if Q.dtype.is_fp8():
                 V = V_load
             else:
+                tl.static_print(f"??????????????????????Q is not fp8 and V is fp8")
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
+            tl.static_print(f"??????????????????????Q is not fp8 and V is not fp8")
             V = V_load
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if Q.dtype.is_fp8() and K.dtype.is_fp8():
+            tl.static_print(f"!!!!!!!!!!!!!!!Q is fp8 and K is fp8")
+            q_scale_val = tl.load(q_scale)
+            k_scale_val = tl.load(k_scale)
+            # if tl.program_id(0) == 0 and tl.program_id(1) == 0 and tl.program_id(2) == 0:
+            #     tl.device_print("q_scale_val:", q_scale_val)
+            #     tl.device_print("k_scale_val:", k_scale_val)
+            S = qk_scale * tl.dot(Q, K) * k_scale_val * q_scale_val
+        else:
+            tl.static_print(f"??????????????????????Q is not fp8 and K is not fp8")
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -667,7 +709,26 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if Q.dtype.is_fp8() and V.dtype.is_fp8():
+            tl.static_print(f"!!!!!!!!!!!!!!!Q is fp8 and V is fp8")
+            P_scale_val = tl.load(p_scale)
+            v_scale_val = tl.load(v_scale)
+            if tl.program_id(0) == 0 and tl.program_id(1) == 0 and tl.program_id(2) == 0:
+                tl.device_print("P_scale_val:", P_scale_val)
+                tl.device_print("v_scale_val:", v_scale_val)
+            P_scaled = P / P_scale_val
+            P_32 = P_scaled.to(tl.float32)
+            P_8 = P_32.to(tl.float8e4nv)
+            P_32_2 = P_8.to(tl.float32)
+            V_32 = V.to(tl.float32)
+
+            acc_1 = tl.dot(P_32_2, V_32)
+            acc_1 = acc_1 * P_scale_val * v_scale_val
+            acc += acc_1
+        else:
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            tl.static_print(f"??????????????????????Q is not fp8 and V is not fp8")
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
