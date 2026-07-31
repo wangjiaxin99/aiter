@@ -182,6 +182,13 @@ def gemm_afp4wfp4_(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
+    # Clamp below the real K-loop trip count. With EVEN_K=False,
+    # over-pipelining the masked tail can read stale data and produce NaN/Inf.
+    num_k_iter = triton.cdiv(
+        config["SPLITK_BLOCK_SIZE"] // 2, config["BLOCK_SIZE_K"] // 2
+    )
+    config["num_stages"] = max(1, min(config["num_stages"], num_k_iter - 1))
+
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
